@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh:*)",
+      "Bash(gh auth:*)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" --version)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status:*)",
+      "Bash(jq:*)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" api --help)",
+      "Bash(chmod:*)",
+      "Bash(bash:*)",
+      "Bash(claude:*)",
+      "Bash(git push:*)",
+      "Bash(git worktree:*)"
+    ]
+  }
+}

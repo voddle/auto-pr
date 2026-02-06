@@ -1,0 +1,988 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════════
+# pr-watch — GitHub PR/Issue watcher with worktree isolation
+#
+# Three modes:
+#   pr-watch [PR_NUMBER] [--interval N] [--once]
+#       Single-PR mode (backward compatible, synchronous foreground)
+#
+#   pr-watch --repo [--interval N] [--once] [--max-concurrent N]
+#       Repo-level mode (lightweight scheduler, spawns workers)
+#
+#   pr-watch --worker N [--interval N] [--once]
+#       Worker mode (internal, one per issue — implement + watch reviews)
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Infrastructure: CLI Detection ─────────────────────────────────
+
+detect_gh() {
+  if command -v gh &>/dev/null; then
+    GH="gh"
+  elif [ -x "/c/Program Files/GitHub CLI/gh.exe" ]; then
+    GH="/c/Program Files/GitHub CLI/gh.exe"
+  elif [ -x "/mnt/c/Program Files/GitHub CLI/gh.exe" ]; then
+    GH="/mnt/c/Program Files/GitHub CLI/gh.exe"
+  else
+    echo "Error: gh CLI not found. Install from https://cli.github.com" >&2
+    exit 1
+  fi
+}
+
+detect_claude() {
+  if command -v claude &>/dev/null; then
+    CLAUDE="claude"
+  else
+    echo "Error: claude CLI not found. Ensure 'claude' is in PATH." >&2
+    exit 1
+  fi
+}
+
+# ── Infrastructure: Configuration ─────────────────────────────────
+
+load_config() {
+  # Defaults
+  MAX_CONCURRENT=2
+  INTERVAL=30
+  ISSUE_LABELS="auto,claude"
+  WORKTREE_DIR=".worktrees"
+  BASE_BRANCH=""
+
+  local conf="${PROJECT_ROOT}/.pr-watch.conf"
+  if [[ -f "$conf" ]]; then
+    # Source config file (only known variables)
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # Skip comments and empty lines
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line// /}" ]] && continue
+      key="${line%%=*}"
+      val="${line#*=}"
+      # Strip surrounding quotes
+      val="${val%\"}"
+      val="${val#\"}"
+      val="${val%\'}"
+      val="${val#\'}"
+      case "$key" in
+        MAX_CONCURRENT) MAX_CONCURRENT="$val" ;;
+        INTERVAL)       INTERVAL="$val" ;;
+        ISSUE_LABELS)   ISSUE_LABELS="$val" ;;
+        WORKTREE_DIR)   WORKTREE_DIR="$val" ;;
+        BASE_BRANCH)    BASE_BRANCH="$val" ;;
+      esac
+    done < "$conf"
+  fi
+}
+
+# ── Infrastructure: Argument Parsing ──────────────────────────────
+
+parse_args() {
+  PR_NUMBER=""
+  ONCE=false
+  REPO_MODE=false
+  WORKER_MODE=false
+  WORKER_ISSUE=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        REPO_MODE=true
+        shift
+        ;;
+      --worker)
+        WORKER_MODE=true
+        WORKER_ISSUE="$2"
+        shift 2
+        ;;
+      --interval)
+        INTERVAL="$2"
+        shift 2
+        ;;
+      --max-concurrent)
+        MAX_CONCURRENT="$2"
+        shift 2
+        ;;
+      --once)
+        ONCE=true
+        shift
+        ;;
+      --help|-h)
+        echo "Usage:"
+        echo "  pr-watch [PR_NUMBER] [--interval N] [--once]"
+        echo "      Single-PR mode: watch one PR (backward compatible)"
+        echo ""
+        echo "  pr-watch --repo [--interval N] [--once] [--max-concurrent N]"
+        echo "      Repo mode: watch all issues with worktree isolation (spawns workers)"
+        echo ""
+        echo "Options:"
+        echo "  --interval N        Poll interval in seconds (default: 30)"
+        echo "  --max-concurrent N  Max concurrent worker processes (default: 2)"
+        echo "  --once              Check once and exit (for debugging)"
+        echo "  --repo              Enable repo-level watching mode"
+        echo "  --help, -h          Show this help"
+        exit 0
+        ;;
+      *)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+          PR_NUMBER="$1"
+        else
+          echo "Error: Unknown argument '$1'" >&2
+          exit 1
+        fi
+        shift
+        ;;
+    esac
+  done
+}
+
+# ── Infrastructure: State Directory ──────────────────────────────
+
+init_state_dir() {
+  STATE_DIR="${PROJECT_ROOT}/.pr-watch-state"
+
+  # Migrate old flat-file state if it exists
+  migrate_old_state
+
+  mkdir -p "${STATE_DIR}/issues"
+  mkdir -p "${STATE_DIR}/prs"
+  mkdir -p "${STATE_DIR}/pids"
+  mkdir -p "${STATE_DIR}/logs"
+}
+
+migrate_old_state() {
+  local old_file="${PROJECT_ROOT}/.pr-watch-state"
+
+  # If old state is a file (not a directory), migrate it
+  if [[ -f "$old_file" ]]; then
+    echo "[pr-watch] Migrating old state file to directory structure..."
+    local tmp_content
+    tmp_content=$(cat "$old_file")
+    rm "$old_file"
+    mkdir -p "${old_file}/prs"
+    mkdir -p "${old_file}/issues"
+    mkdir -p "${old_file}/pids"
+
+    # Parse old format: lines of "PR_NUMBER_TIMESTAMP"
+    local line pr_num ts
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -z "$line" ]] && continue
+      pr_num="${line%%_*}"
+      ts="${line#*_}"
+      if [[ -n "$pr_num" && -n "$ts" ]]; then
+        echo "{\"last_comment_ts\":\"${ts}\",\"pid\":0,\"branch\":\"\"}" > "${old_file}/prs/${pr_num}.json"
+      fi
+    done <<< "$tmp_content"
+    echo "[pr-watch] Migration complete."
+  fi
+}
+
+# ── Infrastructure: Cleanup on Exit ──────────────────────────────
+
+BACKGROUND_PIDS=()
+
+cleanup_on_exit() {
+  echo ""
+  echo "[pr-watch] Shutting down, terminating background processes..."
+  for pid in "${BACKGROUND_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      echo "[pr-watch] Terminated PID $pid"
+    fi
+  done
+  # Clean up PID files for our tracked processes
+  if [[ -d "${STATE_DIR}/pids" ]]; then
+    for pid_file in "${STATE_DIR}/pids"/*.json; do
+      [[ -f "$pid_file" ]] || continue
+      local pid
+      pid=$(basename "$pid_file" .json)
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$pid_file"
+      fi
+    done
+  fi
+  echo "[pr-watch] Goodbye."
+}
+
+# ── State Read/Write: Issues ─────────────────────────────────────
+
+read_issue_state() {
+  local n="$1"
+  local f="${STATE_DIR}/issues/${n}.json"
+  if [[ -f "$f" ]]; then
+    cat "$f"
+  else
+    echo ""
+  fi
+}
+
+write_issue_state() {
+  local n="$1"
+  local json="$2"
+  echo "$json" > "${STATE_DIR}/issues/${n}.json"
+}
+
+# ── State Read/Write: PRs ────────────────────────────────────────
+
+read_pr_state() {
+  local n="$1"
+  local f="${STATE_DIR}/prs/${n}.json"
+  if [[ -f "$f" ]]; then
+    cat "$f"
+  else
+    echo ""
+  fi
+}
+
+write_pr_state() {
+  local n="$1"
+  local json="$2"
+  echo "$json" > "${STATE_DIR}/prs/${n}.json"
+}
+
+# ── State: PID Management ────────────────────────────────────────
+
+register_pid() {
+  local pid="$1" type="$2" number="$3" worktree="$4"
+  local now
+  now=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ')
+  echo "{\"type\":\"${type}\",\"number\":${number},\"worktree\":\"${worktree}\",\"started_at\":\"${now}\"}" \
+    > "${STATE_DIR}/pids/${pid}.json"
+  BACKGROUND_PIDS+=("$pid")
+}
+
+unregister_pid() {
+  local pid="$1"
+  rm -f "${STATE_DIR}/pids/${pid}.json"
+  # Remove from array
+  local new_pids=()
+  for p in "${BACKGROUND_PIDS[@]}"; do
+    [[ "$p" != "$pid" ]] && new_pids+=("$p")
+  done
+  BACKGROUND_PIDS=("${new_pids[@]+"${new_pids[@]}"}")
+}
+
+count_active_pids() {
+  local count=0
+  if [[ ! -d "${STATE_DIR}/pids" ]]; then
+    echo "0"
+    return
+  fi
+  for pid_file in "${STATE_DIR}/pids"/*.json; do
+    [[ -f "$pid_file" ]] || continue
+    local pid
+    pid=$(basename "$pid_file" .json)
+    if kill -0 "$pid" 2>/dev/null; then
+      # Check for stale processes (> 2 hours)
+      local started_at
+      started_at=$("$GH" api --input "$pid_file" --jq '.started_at' 2>/dev/null || echo "")
+      if [[ -n "$started_at" ]]; then
+        local started_epoch now_epoch
+        started_epoch=$(date -d "$started_at" '+%s' 2>/dev/null || echo "0")
+        now_epoch=$(date '+%s' 2>/dev/null || echo "0")
+        if [[ "$started_epoch" -gt 0 && "$now_epoch" -gt 0 ]]; then
+          local elapsed=$(( now_epoch - started_epoch ))
+          if [[ "$elapsed" -gt 7200 ]]; then
+            echo "[pr-watch] Warning: PID $pid has been running for over 2 hours, considering stale." >&2
+            kill "$pid" 2>/dev/null || true
+            rm -f "$pid_file"
+            continue
+          fi
+        fi
+      fi
+      count=$((count + 1))
+    else
+      # Dead process — clean up
+      rm -f "$pid_file"
+    fi
+  done
+  echo "$count"
+}
+
+has_slot_available() {
+  local active
+  active=$(count_active_pids)
+  [[ "$active" -lt "$MAX_CONCURRENT" ]]
+}
+
+# ── Worktree Management ──────────────────────────────────────────
+
+ensure_worktree() {
+  local branch="$1"
+  local name="$2"
+  local wt_path="${PROJECT_ROOT}/${WORKTREE_DIR}/${name}"
+
+  if [[ -d "$wt_path" ]]; then
+    # Verify it's a valid worktree
+    if git -C "$wt_path" rev-parse --git-dir &>/dev/null; then
+      # Pull latest
+      echo "[pr-watch] Worktree '${name}' exists, pulling latest..."
+      git -C "$wt_path" fetch origin "$branch" 2>/dev/null || true
+      git -C "$wt_path" reset --hard "origin/${branch}" 2>/dev/null || \
+        git -C "$wt_path" checkout "$branch" 2>/dev/null || true
+    else
+      # Corrupted worktree — remove and recreate
+      echo "[pr-watch] Worktree '${name}' corrupted, recreating..."
+      git worktree remove --force "$wt_path" 2>/dev/null || rm -rf "$wt_path"
+      git worktree add "$wt_path" "$branch" 2>/dev/null || {
+        echo "[pr-watch] Warning: Failed to create worktree for '${name}'." >&2
+        return 1
+      }
+    fi
+  else
+    echo "[pr-watch] Creating worktree '${name}' on branch '${branch}'..."
+    mkdir -p "${PROJECT_ROOT}/${WORKTREE_DIR}"
+    git worktree add "$wt_path" "$branch" 2>/dev/null || {
+      # Branch might not exist locally yet — try fetching
+      git fetch origin "$branch" 2>/dev/null || true
+      git worktree add "$wt_path" "$branch" 2>/dev/null || \
+      git worktree add -b "$branch" "$wt_path" "origin/${branch}" 2>/dev/null || {
+        echo "[pr-watch] Warning: Failed to create worktree for '${name}'." >&2
+        return 1
+      }
+    }
+  fi
+  echo "$wt_path"
+}
+
+create_issue_worktree() {
+  local n="$1"
+  local branch="auto/issue-${n}"
+  local base="${BASE_BRANCH}"
+
+  if [[ -z "$base" ]]; then
+    # Detect default branch
+    base=$("$GH" api "repos/${REPO}" --jq '.default_branch' 2>/dev/null || echo "main")
+  fi
+
+  # Ensure we have latest base
+  git fetch origin "$base" 2>/dev/null || true
+
+  # Create the branch from base
+  git branch "$branch" "origin/${base}" 2>/dev/null || true
+
+  ensure_worktree "$branch" "issue-${n}"
+}
+
+cleanup_stale_worktrees() {
+  if [[ ! -d "${PROJECT_ROOT}/${WORKTREE_DIR}" ]]; then
+    return
+  fi
+
+  for wt_dir in "${PROJECT_ROOT}/${WORKTREE_DIR}"/*/; do
+    [[ -d "$wt_dir" ]] || continue
+    local name
+    name=$(basename "$wt_dir")
+
+    # Determine if this is an issue or PR worktree
+    if [[ "$name" =~ ^issue-([0-9]+)$ ]]; then
+      local issue_num="${BASH_REMATCH[1]}"
+      # Check if a worker is still running for this issue
+      local state
+      state=$(read_issue_state "$issue_num")
+      if [[ -n "$state" ]]; then
+        local status
+        status=$(echo "$state" | "$GH" api --input - --jq '.status // ""' 2>/dev/null || echo "")
+        # Don't clean up worktrees that have active workers
+        if [[ "$status" == "in_progress" || "$status" == "watching" ]]; then
+          local pid
+          pid=$(echo "$state" | "$GH" api --input - --jq '.pid // 0' 2>/dev/null || echo "0")
+          if [[ "$pid" -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
+            continue
+          fi
+        fi
+      fi
+      local issue_state
+      issue_state=$("$GH" api "repos/${REPO}/issues/${issue_num}" --jq '.state' 2>/dev/null || echo "")
+      if [[ "$issue_state" == "closed" ]]; then
+        echo "[pr-watch] Issue #${issue_num} is closed, removing worktree..."
+        git worktree remove --force "$wt_dir" 2>/dev/null || {
+          echo "[pr-watch] Warning: Could not remove worktree '${name}', will retry later." >&2
+        }
+      fi
+    elif [[ "$name" =~ ^pr-([0-9]+)$ ]]; then
+      local pr_num="${BASH_REMATCH[1]}"
+      local pr_state
+      pr_state=$("$GH" api "repos/${REPO}/pulls/${pr_num}" --jq '.state' 2>/dev/null || echo "")
+      if [[ "$pr_state" == "closed" || "$pr_state" == "merged" ]]; then
+        echo "[pr-watch] PR #${pr_num} is ${pr_state}, removing worktree..."
+        git worktree remove --force "$wt_dir" 2>/dev/null || {
+          echo "[pr-watch] Warning: Could not remove worktree '${name}', will retry later." >&2
+        }
+      fi
+    fi
+  done
+}
+
+# ── PR Comment Helpers ───────────────────────────────────────────
+
+get_latest_pr_comment_ts() {
+  local pr_num="$1"
+  local comments reviews ts_comments ts_reviews
+
+  comments=$("$GH" api "repos/${REPO}/pulls/${pr_num}/comments" \
+    --paginate 2>/dev/null) || echo "[]"
+  reviews=$("$GH" api "repos/${REPO}/pulls/${pr_num}/reviews" \
+    --paginate 2>/dev/null) || echo "[]"
+
+  ts_comments=$(echo "$comments" | "$GH" api --input - \
+    --jq 'if type=="array" then . else [.] end | map(.updated_at // .created_at) | max // empty' 2>/dev/null || true)
+  ts_reviews=$(echo "$reviews" | "$GH" api --input - \
+    --jq 'if type=="array" then . else [.] end | map(.submitted_at // empty) | max // empty' 2>/dev/null || true)
+
+  if [[ -z "$ts_comments" && -z "$ts_reviews" ]]; then
+    echo ""
+  elif [[ -z "$ts_comments" ]]; then
+    echo "$ts_reviews"
+  elif [[ -z "$ts_reviews" ]]; then
+    echo "$ts_comments"
+  elif [[ "$ts_comments" > "$ts_reviews" ]]; then
+    echo "$ts_comments"
+  else
+    echo "$ts_reviews"
+  fi
+}
+
+fetch_new_pr_comments() {
+  local pr_num="$1"
+  local since="$2"
+  local comments reviews new_comments new_reviews
+
+  comments=$("$GH" api "repos/${REPO}/pulls/${pr_num}/comments" \
+    --paginate 2>/dev/null) || echo "[]"
+  reviews=$("$GH" api "repos/${REPO}/pulls/${pr_num}/reviews" \
+    --paginate 2>/dev/null) || echo "[]"
+
+  new_comments=$(echo "$comments" | "$GH" api --input - \
+    --jq "if type==\"array\" then . else [.] end | map(select((.updated_at // .created_at) > \"${since}\"))" 2>/dev/null || echo "[]")
+
+  new_reviews=$(echo "$reviews" | "$GH" api --input - \
+    --jq "if type==\"array\" then . else [.] end | map(select((.submitted_at // \"\") > \"${since}\" and .body != \"\"))" 2>/dev/null || echo "[]")
+
+  local c_count r_count
+  c_count=$(echo "$new_comments" | "$GH" api --input - --jq 'length' 2>/dev/null || echo "0")
+  r_count=$(echo "$new_reviews" | "$GH" api --input - --jq 'length' 2>/dev/null || echo "0")
+
+  local total=$((c_count + r_count))
+  if [[ "$total" -eq 0 ]]; then
+    echo ""
+    return
+  fi
+
+  echo "{\"inline_comments\":${new_comments},\"top_level_reviews\":${new_reviews}}"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Worker Mode — One long-lived process per issue
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Worker: Spawn ────────────────────────────────────────────────
+
+spawn_worker() {
+  local issue_num="$1"
+
+  if ! has_slot_available; then
+    echo "[pr-watch] No slots available, deferring issue #${issue_num}"
+    return 1
+  fi
+
+  local log_file="${STATE_DIR}/logs/issue-${issue_num}.log"
+
+  # Launch self in worker mode as a background process
+  "$0" --worker "$issue_num" --interval "$INTERVAL" >> "$log_file" 2>&1 &
+  local pid=$!
+  register_pid "$pid" "worker" "$issue_num" "${WORKTREE_DIR}/issue-${issue_num}"
+  write_issue_state "$issue_num" "{\"status\":\"in_progress\",\"pid\":${pid},\"branch\":\"auto/issue-${issue_num}\",\"pr_number\":0}"
+  echo "[pr-watch] Spawned worker PID $pid for issue #${issue_num} (log: ${log_file})"
+}
+
+# ── Worker: Monitor ──────────────────────────────────────────────
+
+monitor_workers() {
+  if [[ ! -d "${STATE_DIR}/pids" ]]; then
+    return
+  fi
+
+  for pid_file in "${STATE_DIR}/pids"/*.json; do
+    [[ -f "$pid_file" ]] || continue
+    local pid
+    pid=$(basename "$pid_file" .json)
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # Worker has exited
+      local type number
+      type=$("$GH" api --input "$pid_file" --jq '.type' 2>/dev/null || echo "unknown")
+      number=$("$GH" api --input "$pid_file" --jq '.number' 2>/dev/null || echo "0")
+
+      # Check exit status via wait (works for child processes)
+      if wait "$pid" 2>/dev/null; then
+        echo "[pr-watch] Worker completed: ${type} #${number} (PID ${pid})"
+        if [[ "$type" == "worker" ]]; then
+          local st
+          st=$(read_issue_state "$number")
+          if [[ -n "$st" ]]; then
+            local current_status
+            current_status=$(echo "$st" | "$GH" api --input - --jq '.status // ""' 2>/dev/null || echo "")
+            # Only mark done if not already done (worker may have already set its own state)
+            if [[ "$current_status" != "done" ]]; then
+              write_issue_state "$number" "$(echo "$st" | sed 's/"status":"[^"]*"/"status":"done"/' | sed "s/\"pid\":[0-9]*/\"pid\":0/")"
+            fi
+          fi
+        fi
+      else
+        echo "[pr-watch] Worker failed: ${type} #${number} (PID ${pid})"
+        if [[ "$type" == "worker" ]]; then
+          local st
+          st=$(read_issue_state "$number")
+          if [[ -n "$st" ]]; then
+            write_issue_state "$number" "$(echo "$st" | sed 's/"status":"[^"]*"/"status":"failed"/' | sed "s/\"pid\":[0-9]*/\"pid\":0/")"
+          fi
+        fi
+      fi
+
+      unregister_pid "$pid"
+    fi
+  done
+}
+
+# ── Worker: Detect PR created by worker ──────────────────────────
+
+worker_detect_pr() {
+  local issue_num="$1"
+  local branch="auto/issue-${issue_num}"
+
+  # Try to find a PR for this branch
+  local pr_num
+  pr_num=$("$GH" api "repos/${REPO}/pulls?head=${REPO%%/*}:${branch}&state=open" \
+    --jq '.[0].number // empty' 2>/dev/null || true)
+
+  if [[ -z "$pr_num" ]]; then
+    # Also try without the owner prefix (some repos need just the branch name)
+    pr_num=$("$GH" api "repos/${REPO}/pulls?state=open" \
+      --jq ".[] | select(.head.ref==\"${branch}\") | .number" 2>/dev/null | head -1 || true)
+  fi
+
+  echo "$pr_num"
+}
+
+# ── Worker: Phase 1 — Implement Issue ────────────────────────────
+
+worker_implement_issue() {
+  local issue_num="$1"
+  local wt_path="${PROJECT_ROOT}/${WORKTREE_DIR}/issue-${issue_num}"
+
+  # Fetch issue details
+  local title body
+  title=$("$GH" api "repos/${REPO}/issues/${issue_num}" --jq '.title' 2>/dev/null || echo "")
+  body=$("$GH" api "repos/${REPO}/issues/${issue_num}" --jq '.body // ""' 2>/dev/null || echo "")
+
+  echo "[worker #${issue_num}] Phase 1: Implementing issue — ${title}"
+
+  # Build prompt
+  local prompt
+  prompt="You are working in a git worktree for issue #${issue_num} in repo ${REPO}.
+Issue title: ${title}
+Issue body:
+${body}
+
+Your task:
+1. Read the issue and understand the requirement
+2. Explore the codebase, implement the solution
+3. Commit with message referencing the issue (e.g. \"fix #${issue_num}: ...\")
+4. git push -u origin auto/issue-${issue_num}
+5. Create a PR with: gh pr create --title \"<descriptive title>\" --body \"Fixes #${issue_num}\"
+
+Constraints: Only modify relevant files. Do not touch CLAUDE.md, .claude/, scripts/, .gitignore, CI configs."
+
+  # First call — establishes session in this worktree directory
+  (cd "$wt_path" && "$CLAUDE" -p "$prompt" --verbose 2>&1) || {
+    echo "[worker #${issue_num}] Warning: claude exited with error during implementation" >&2
+    return 1
+  }
+
+  echo "[worker #${issue_num}] Phase 1 complete."
+}
+
+# ── Worker: Phase 2 — Watch Reviews ─────────────────────────────
+
+worker_watch_reviews() {
+  local pr_num="$1" issue_num="$2"
+  local wt_path="${PROJECT_ROOT}/${WORKTREE_DIR}/issue-${issue_num}"
+
+  echo "[worker #${issue_num}] Phase 2: Watching reviews on PR #${pr_num}"
+
+  # Snapshot current comment timestamp
+  local last_ts
+  last_ts=$(get_latest_pr_comment_ts "$pr_num")
+  [[ -z "$last_ts" ]] && last_ts="1970-01-01T00:00:00Z"
+
+  echo "[worker #${issue_num}] Baseline review timestamp: ${last_ts}"
+
+  while true; do
+    sleep "$INTERVAL"
+
+    # Check if PR is still open
+    local pr_state
+    pr_state=$("$GH" api "repos/${REPO}/pulls/${pr_num}" --jq '.state' 2>/dev/null || echo "")
+    if [[ "$pr_state" != "open" ]]; then
+      echo "[worker #${issue_num}] PR #${pr_num} is ${pr_state}, exiting review loop."
+      break
+    fi
+
+    # Check for new comments
+    local new_data
+    new_data=$(fetch_new_pr_comments "$pr_num" "$last_ts")
+    [[ -z "$new_data" ]] && continue
+
+    local inline_count review_count
+    inline_count=$(echo "$new_data" | "$GH" api --input - --jq '.inline_comments | length' 2>/dev/null || echo "0")
+    review_count=$(echo "$new_data" | "$GH" api --input - --jq '.top_level_reviews | length' 2>/dev/null || echo "0")
+    echo "[worker #${issue_num}] PR #${pr_num}: ${inline_count} new inline comment(s), ${review_count} new review(s)"
+
+    # Build review prompt
+    local prompt
+    prompt="New review comments on PR #${pr_num} (branch: auto/issue-${issue_num}) in repo ${REPO}:
+
+${new_data}
+
+【Edit scope constraints — MUST strictly follow】
+- You may ONLY modify files explicitly mentioned in the review comments (the 'path' field of inline comments defines your editing scope). Do NOT edit any file not referenced by a review comment.
+- Only change code related to the reviewer's feedback — do not refactor, reformat, or \"improve\" surrounding code beyond what the reviewer requested.
+- Do NOT modify project infrastructure files: CLAUDE.md, .claude/, scripts/, .gitignore, CI configs.
+- If a review comment is ambiguous or references files not in the PR, use ./scripts/pr-reply to ask for clarification instead of guessing.
+
+For each inline comment (items in inline_comments array):
+1. Read the file mentioned in the comment (path field) at the code location (line field)
+2. Modify the code per the reviewer's feedback (only that file)
+3. After all modifications, commit and push with a single commit
+4. For each inline comment, reply using: ./scripts/pr-reply <comment_id> \"brief description of what you changed\"
+
+For top_level_reviews, if they contain specific modification suggestions, handle them too (same edit scope constraints).
+
+Note: The 'id' field of each comment is the comment_id needed for pr-reply."
+
+    # Key: --continue reuses session context from previous calls in this worktree
+    (cd "$wt_path" && "$CLAUDE" -p "$prompt" --continue --verbose 2>&1) || {
+      echo "[worker #${issue_num}] Warning: claude exited with error during review handling" >&2
+    }
+
+    # Update timestamp
+    last_ts=$(get_latest_pr_comment_ts "$pr_num")
+    [[ -z "$last_ts" ]] && last_ts="$last_ts"
+
+    echo "[worker #${issue_num}] Updated review timestamp to: ${last_ts}"
+
+    # If --once mode, exit after one review cycle
+    if $ONCE; then
+      echo "[worker #${issue_num}] --once mode, exiting review loop."
+      break
+    fi
+  done
+}
+
+# ── Worker: Main ─────────────────────────────────────────────────
+
+run_worker_mode() {
+  local issue_num="$1"
+
+  echo "[worker #${issue_num}] Starting worker for issue #${issue_num} in repo ${REPO}"
+
+  # Phase 1: Create worktree and implement issue
+  local wt_path
+  wt_path=$(create_issue_worktree "$issue_num") || {
+    echo "[worker #${issue_num}] Failed to create worktree." >&2
+    write_issue_state "$issue_num" "{\"status\":\"failed\",\"pid\":$$,\"branch\":\"auto/issue-${issue_num}\",\"pr_number\":0}"
+    exit 1
+  }
+
+  worker_implement_issue "$issue_num" || {
+    echo "[worker #${issue_num}] Implementation failed." >&2
+    write_issue_state "$issue_num" "{\"status\":\"failed\",\"pid\":$$,\"branch\":\"auto/issue-${issue_num}\",\"pr_number\":0}"
+    exit 1
+  }
+
+  # Detect PR created by claude
+  echo "[worker #${issue_num}] Detecting PR..."
+  local pr_num
+  pr_num=$(worker_detect_pr "$issue_num")
+
+  if [[ -z "$pr_num" ]]; then
+    echo "[worker #${issue_num}] No PR found. Claude may not have created one." >&2
+    write_issue_state "$issue_num" "{\"status\":\"failed\",\"pid\":$$,\"branch\":\"auto/issue-${issue_num}\",\"pr_number\":0}"
+    exit 1
+  fi
+
+  echo "[worker #${issue_num}] PR #${pr_num} detected."
+  write_issue_state "$issue_num" "{\"status\":\"watching\",\"pid\":$$,\"branch\":\"auto/issue-${issue_num}\",\"pr_number\":${pr_num}}"
+
+  # Phase 2: Watch reviews
+  worker_watch_reviews "$pr_num" "$issue_num"
+
+  # Done — PR was merged or closed
+  write_issue_state "$issue_num" "{\"status\":\"done\",\"pid\":0,\"branch\":\"auto/issue-${issue_num}\",\"pr_number\":${pr_num}}"
+  echo "[worker #${issue_num}] PR #${pr_num} closed/merged, worker exiting."
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Single PR Mode (backward compatible)
+# ═══════════════════════════════════════════════════════════════════
+
+run_single_pr_mode() {
+  # ── Resolve PR number ───────────────────────────────────────────
+  if [[ -z "$PR_NUMBER" ]]; then
+    local branch
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || {
+      echo "Error: Not inside a git repository." >&2
+      exit 1
+    }
+    PR_NUMBER=$("$GH" api "repos/${REPO}/pulls" \
+      --jq ".[] | select(.head.ref==\"${branch}\") | .number" 2>/dev/null | head -1)
+    if [[ -z "$PR_NUMBER" ]]; then
+      echo "Error: No open PR found for branch '${branch}'." >&2
+      exit 1
+    fi
+    echo "Detected PR #${PR_NUMBER} for branch '${branch}'"
+  fi
+
+  # ── Read/init state (using new directory structure) ─────────────
+  local state last_ts
+  state=$(read_pr_state "$PR_NUMBER")
+  if [[ -n "$state" ]]; then
+    last_ts=$(echo "$state" | "$GH" api --input - --jq '.last_comment_ts // ""' 2>/dev/null || echo "")
+  else
+    last_ts=""
+  fi
+
+  if [[ -z "$last_ts" ]]; then
+    echo "[pr-watch] First run — recording current comment state..."
+    last_ts=$(get_latest_pr_comment_ts "$PR_NUMBER")
+    if [[ -n "$last_ts" ]]; then
+      write_pr_state "$PR_NUMBER" "{\"last_comment_ts\":\"${last_ts}\",\"pid\":0,\"branch\":\"\"}"
+      echo "[pr-watch] Baseline timestamp: ${last_ts}"
+    else
+      last_ts="1970-01-01T00:00:00Z"
+      write_pr_state "$PR_NUMBER" "{\"last_comment_ts\":\"${last_ts}\",\"pid\":0,\"branch\":\"\"}"
+      echo "[pr-watch] No existing comments found, watching for new ones."
+    fi
+  else
+    echo "[pr-watch] Resuming from timestamp: ${last_ts}"
+  fi
+
+  echo "[pr-watch] Watching PR #${PR_NUMBER} on ${REPO} (interval: ${INTERVAL}s)"
+  echo ""
+
+  # ── Main loop ───────────────────────────────────────────────────
+  while true; do
+    echo "[pr-watch] $(date '+%H:%M:%S') Checking for new comments..."
+
+    local new_data
+    new_data=$(fetch_new_pr_comments "$PR_NUMBER" "$last_ts")
+
+    if [[ -z "$new_data" ]]; then
+      echo "[pr-watch] No new comments."
+    else
+      local inline_count review_count
+      inline_count=$(echo "$new_data" | "$GH" api --input - --jq '.inline_comments | length' 2>/dev/null || echo "0")
+      review_count=$(echo "$new_data" | "$GH" api --input - --jq '.top_level_reviews | length' 2>/dev/null || echo "0")
+      echo "[pr-watch] Found ${inline_count} new inline comment(s), ${review_count} new review(s)."
+
+      # Print comment previews
+      echo "$new_data" | "$GH" api --input - \
+        --jq '.inline_comments[] | "  -> @\(.user.login) on \(.path):\(.line // .original_line // "?"): \(.body | split("\n") | first)"' 2>/dev/null || true
+      echo "$new_data" | "$GH" api --input - \
+        --jq '.top_level_reviews[] | "  -> @\(.user.login) [\(.state)]: \(.body | split("\n") | first)"' 2>/dev/null || true
+
+      echo ""
+      echo "[pr-watch] Dispatching to Claude Code..."
+
+      # Build the prompt for Claude
+      local prompt
+      prompt="以下是 GitHub PR #${PR_NUMBER} (repo: ${REPO}) 的新 review 评论，请逐一处理：
+
+${new_data}
+
+【编辑范围约束 — 必须严格遵守】
+- 你只能修改 review 评论中 path 字段明确提到的文件，禁止修改任何其他文件
+- 只针对 reviewer 提出的具体问题做修改，不要顺带重构、格式化或"改进"周围代码
+- 禁止修改项目基础设施文件：CLAUDE.md、.claude/、scripts/、.gitignore、CI 配置等
+- 如果评论含糊不清或涉及不在 PR 中的文件，用 pr-reply 回复询问而非猜测修改
+
+对于每条 inline comment（inline_comments 数组中的项）：
+1. 阅读评论中提到的文件 (path 字段) 和代码位置 (line 字段)
+2. 按照 reviewer 的意见修改代码（仅限该文件）
+3. 完成所有修改后，用一个 commit 提交并 push
+4. 对每条 inline comment 使用 ./scripts/pr-reply <comment_id> \"简要说明你做了什么修改\" 进行回复
+
+对于 top_level_reviews 中的评论，如果包含具体修改建议也请一并处理（同样遵守编辑范围约束）。
+
+注意：comment 的 id 字段就是 pr-reply 需要的 comment_id。"
+
+      # Call claude in headless mode (synchronous, foreground)
+      "$CLAUDE" -p "$prompt" --verbose 2>&1 || {
+        echo "[pr-watch] Warning: Claude Code exited with non-zero status." >&2
+      }
+
+      echo ""
+      echo "[pr-watch] Claude Code finished processing."
+
+      # Update timestamp
+      last_ts=$(get_latest_pr_comment_ts "$PR_NUMBER")
+      if [[ -n "$last_ts" ]]; then
+        write_pr_state "$PR_NUMBER" "{\"last_comment_ts\":\"${last_ts}\",\"pid\":0,\"branch\":\"\"}"
+        echo "[pr-watch] Updated timestamp to: ${last_ts}"
+      fi
+    fi
+
+    # Exit if --once mode
+    if $ONCE; then
+      echo "[pr-watch] --once mode, exiting."
+      exit 0
+    fi
+
+    echo "[pr-watch] Sleeping ${INTERVAL}s..."
+    sleep "$INTERVAL"
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Repo Mode (lightweight scheduler — spawns workers for issues)
+# ═══════════════════════════════════════════════════════════════════
+
+scan_issues() {
+  if [[ -z "$ISSUE_LABELS" ]]; then
+    return
+  fi
+
+  # Convert comma-separated labels to URL-encoded format
+  local labels_param
+  labels_param=$(echo "$ISSUE_LABELS" | sed 's/,/%2C/g')
+
+  local issues
+  issues=$("$GH" api "repos/${REPO}/issues?labels=${labels_param}&state=open&sort=created&direction=asc" \
+    --paginate 2>/dev/null) || {
+    echo "[pr-watch] Warning: Failed to fetch issues." >&2
+    return
+  }
+
+  # Iterate over each issue
+  local issue_numbers
+  issue_numbers=$(echo "$issues" | "$GH" api --input - \
+    --jq 'if type=="array" then . else [.] end | .[] | select(.pull_request == null) | .number' 2>/dev/null || true)
+
+  [[ -z "$issue_numbers" ]] && return
+
+  while IFS= read -r issue_num; do
+    [[ -z "$issue_num" ]] && continue
+
+    # Check if already processed
+    local state
+    state=$(read_issue_state "$issue_num")
+    if [[ -n "$state" ]]; then
+      # Already known — skip unless failed (could add retry logic here)
+      continue
+    fi
+
+    # Check if this is a pre-existing issue (first run guard)
+    if [[ ! -f "${STATE_DIR}/.initialized" ]]; then
+      echo "[pr-watch] First run: marking issue #${issue_num} as pre-existing (skipping)"
+      write_issue_state "$issue_num" "{\"status\":\"preexisting\",\"pid\":0,\"branch\":\"\",\"pr_number\":0}"
+      continue
+    fi
+
+    # Fetch issue title for logging
+    local title
+    title=$("$GH" api "repos/${REPO}/issues/${issue_num}" --jq '.title' 2>/dev/null || echo "")
+    echo "[pr-watch] New issue #${issue_num}: ${title}"
+
+    # Spawn a worker for this issue
+    spawn_worker "$issue_num" || {
+      echo "[pr-watch] Could not spawn worker for issue #${issue_num} (no slots or error)."
+    }
+
+  done <<< "$issue_numbers"
+}
+
+run_repo_mode() {
+  echo "[pr-watch] Repo mode — watching ${REPO}"
+  echo "[pr-watch] Config: interval=${INTERVAL}s, max_concurrent=${MAX_CONCURRENT}, issue_labels=${ISSUE_LABELS}"
+  echo "[pr-watch] Worktree dir: ${WORKTREE_DIR}"
+  echo "[pr-watch] Workers handle: Issue implementation → PR creation → Review watching"
+  echo ""
+
+  trap cleanup_on_exit EXIT INT TERM
+
+  # Main loop
+  while true; do
+    echo "[pr-watch] $(date '+%H:%M:%S') Scanning..."
+
+    # 1. Monitor workers (reap finished, update state)
+    monitor_workers
+
+    # 2. Clean up stale worktrees
+    cleanup_stale_worktrees
+
+    # 3. Scan for new issues → spawn workers
+    scan_issues
+
+    # Mark as initialized after first full scan
+    if [[ ! -f "${STATE_DIR}/.initialized" ]]; then
+      touch "${STATE_DIR}/.initialized"
+      echo "[pr-watch] First scan complete, future events will be processed."
+    fi
+
+    # Show active workers
+    local active
+    active=$(count_active_pids)
+    echo "[pr-watch] Active workers: ${active}/${MAX_CONCURRENT}"
+
+    # Exit if --once mode
+    if $ONCE; then
+      if [[ "$active" -gt 0 ]]; then
+        echo "[pr-watch] --once mode, waiting for ${active} active worker(s) to finish..."
+        wait 2>/dev/null || true
+        monitor_workers
+      fi
+      echo "[pr-watch] --once mode, exiting."
+      exit 0
+    fi
+
+    echo "[pr-watch] Sleeping ${INTERVAL}s..."
+    sleep "$INTERVAL"
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════════════════
+
+# Detect tools
+detect_gh
+detect_claude
+
+# Resolve project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load config (sets defaults, then overrides from .pr-watch.conf)
+load_config
+
+# Parse CLI arguments (may override config values)
+parse_args "$@"
+
+# Resolve repo slug
+REPO=$("$GH" repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) || {
+  echo "Error: Not inside a GitHub repository." >&2
+  exit 1
+}
+
+# Initialize state directory
+init_state_dir
+
+# Dispatch to appropriate mode
+if $WORKER_MODE; then
+  run_worker_mode "$WORKER_ISSUE"
+elif $REPO_MODE; then
+  run_repo_mode
+else
+  run_single_pr_mode
+fi
