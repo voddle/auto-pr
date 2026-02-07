@@ -11,7 +11,14 @@
       "Bash(bash:*)",
       "Bash(claude:*)",
       "Bash(git push:*)",
-      "Bash(git worktree:*)"
+      "Bash(git worktree:*)",
+      "Bash(go version:*)",
+      "Bash(go mod init:*)",
+      "Bash(go build:*)",
+      "Bash(./auto-pr.exe:*)",
+      "Bash(go vet:*)",
+      "Bash(echo:*)",
+      "WebSearch"
     ]
   }
 }

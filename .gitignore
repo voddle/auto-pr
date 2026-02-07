@@ -1,3 +1,5 @@
 .pr-watch-state
 .pr-watch-state/
 .worktrees/
+auto-pr
+auto-pr.exe
