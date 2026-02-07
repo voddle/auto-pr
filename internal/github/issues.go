@@ -4,29 +4,40 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"auto-pr/internal/ghcli"
 )
 
-// FetchIssuesWithLabels fetches open issues with the given comma-separated labels.
-// Filters out pull requests (which GitHub API returns as issues too).
+// FetchIssuesWithLabels fetches open issues matching ANY of the given
+// comma-separated labels (OR logic). Each label triggers a separate API call;
+// results are deduplicated by issue number.
 func FetchIssuesWithLabels(ctx context.Context, repo, labels string) ([]Issue, error) {
-	encoded := url.QueryEscape(labels)
-	endpoint := fmt.Sprintf("repos/%s/issues?labels=%s&state=open&sort=created&direction=asc", repo, encoded)
+	seen := map[int]bool{}
+	var result []Issue
 
-	var issues []Issue
-	if err := ghcli.APIPaginateTyped(ctx, endpoint, &issues); err != nil {
-		return nil, fmt.Errorf("fetch issues: %w", err)
-	}
+	for _, label := range strings.Split(labels, ",") {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		encoded := url.QueryEscape(label)
+		endpoint := fmt.Sprintf("repos/%s/issues?labels=%s&state=open&sort=created&direction=asc", repo, encoded)
 
-	// Filter out pull requests
-	var filtered []Issue
-	for _, issue := range issues {
-		if issue.PullRequest == nil {
-			filtered = append(filtered, issue)
+		var issues []Issue
+		if err := ghcli.APIPaginateTyped(ctx, endpoint, &issues); err != nil {
+			return nil, fmt.Errorf("fetch issues (label %q): %w", label, err)
+		}
+
+		for _, issue := range issues {
+			if issue.PullRequest != nil || seen[issue.Number] {
+				continue
+			}
+			seen[issue.Number] = true
+			result = append(result, issue)
 		}
 	}
-	return filtered, nil
+	return result, nil
 }
 
 // GetIssue fetches a single issue by number.

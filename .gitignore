@@ -3,3 +3,6 @@
 .worktrees/
 auto-pr
 auto-pr.exe
+
+# auto-pr state (auto-generated)
+.worktrees"  # Worktree directory/

@@ -40,8 +40,8 @@ func Ensure(projectRoot, worktreeDir, branch, name string) (string, error) {
 		// Branch might not exist locally — try fetching
 		gitInDir(projectRoot, "fetch", "origin", branch)
 		if err := gitInDir(projectRoot, "worktree", "add", wtPath, branch); err != nil {
-			// Try creating branch from remote
-			if err := gitInDir(projectRoot, "worktree", "add", "-b", branch, wtPath, "origin/"+branch); err != nil {
+			// Try creating/resetting branch from remote (-B forces if branch already exists)
+			if err := gitInDir(projectRoot, "worktree", "add", "-B", branch, wtPath, "origin/"+branch); err != nil {
 				return "", fmt.Errorf("failed to create worktree '%s': %w", name, err)
 			}
 		}
@@ -60,6 +60,9 @@ func CreateForIssue(ctx context.Context, projectRoot, worktreeDir, repo string, 
 			baseBranch = "main"
 		}
 	}
+
+	// Prune stale worktree references before creating new ones
+	gitInDir(projectRoot, "worktree", "prune")
 
 	// Fetch latest base
 	gitInDir(projectRoot, "fetch", "origin", baseBranch)

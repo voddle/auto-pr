@@ -42,7 +42,7 @@ const defaultConfTemplate = `# auto-pr watch configuration
 # Poll interval in seconds
 # INTERVAL=30
 
-# Issue labels that trigger auto-processing (comma-separated)
+# Issue labels that trigger auto-processing (comma-separated, OR logic)
 # ISSUE_LABELS="auto,claude"
 
 # Directory for git worktrees
@@ -96,8 +96,17 @@ func Load(projectRoot string) Config {
 		}
 		key := strings.TrimSpace(line[:idx])
 		val := strings.TrimSpace(line[idx+1:])
-		// Strip surrounding quotes
-		val = strings.Trim(val, `"'`)
+		// Strip inline comments and surrounding quotes
+		if len(val) > 0 && (val[0] == '"' || val[0] == '\'') {
+			q := val[0]
+			if end := strings.IndexByte(val[1:], q); end >= 0 {
+				val = val[1 : end+1]
+			} else {
+				val = strings.Trim(val, `"'`)
+			}
+		} else if i := strings.Index(val, "#"); i > 0 {
+			val = strings.TrimSpace(val[:i])
+		}
 
 		switch key {
 		case "MAX_CONCURRENT":

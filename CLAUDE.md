@@ -145,7 +145,7 @@ The embedded default image provides a comprehensive development environment (~2.
 ```bash
 MAX_CONCURRENT=2          # Max concurrent claude processes
 INTERVAL=30               # Poll interval (seconds)
-ISSUE_LABELS="auto,claude" # Issue labels that trigger auto-processing (comma-separated)
+ISSUE_LABELS="auto,claude" # Issue labels that trigger auto-processing (comma-separated, OR logic)
 WORKTREE_DIR=".worktrees"  # Worktree directory
 # BASE_BRANCH="main"      # Base branch for new issue branches (default: repo default branch)
 DOCKER=false              # Enable Docker container isolation (true/false)

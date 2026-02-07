@@ -79,12 +79,6 @@ func Repo(ctx context.Context, repo, projectRoot string, interval, maxConcurrent
 		// 3. Scan for new issues
 		scanAndSpawnWorkers(ctx, repo, projectRoot, interval, once, cfg, stateDir, sem, &wg, activeWorkers, &mu, dockerMgr)
 
-		// Mark initialized after first scan
-		if !stateDir.IsInitialized() {
-			stateDir.MarkInitialized()
-			fmt.Println("[pr-watch] First scan complete, future events will be processed.")
-		}
-
 		mu.Lock()
 		activeCount = len(activeWorkers)
 		mu.Unlock()
@@ -120,17 +114,8 @@ func scanAndSpawnWorkers(ctx context.Context, repo, projectRoot string, interval
 	}
 
 	for _, issue := range issues {
-		// Check if already known
+		// Check if already known (in_progress, watching, done, failed — skip)
 		if s := stateDir.ReadIssue(issue.Number); s != nil {
-			continue
-		}
-
-		// First run guard — mark as preexisting
-		if !stateDir.IsInitialized() {
-			fmt.Printf("[pr-watch] First run: marking issue #%d as pre-existing (skipping)\n", issue.Number)
-			stateDir.WriteIssue(issue.Number, &state.IssueState{
-				Status: state.IssuePreexisting,
-			})
 			continue
 		}
 
