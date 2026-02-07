@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"auto-pr/internal/github"
 )
@@ -46,7 +47,59 @@ func Ensure(projectRoot, worktreeDir, branch, name string) (string, error) {
 			}
 		}
 	}
+	fixWorktreeRelPaths(wtPath)
 	return wtPath, nil
+}
+
+// fixWorktreeRelPaths rewrites the .git pointer file in a worktree and the
+// corresponding gitdir file in the main repo to use relative paths. This is
+// necessary for Docker mode: the project root is bind-mounted into the
+// container at a different absolute path, but relative paths work in both
+// the host and the container since the directory structure is identical.
+func fixWorktreeRelPaths(wtPath string) {
+	// 1. Read {wtPath}/.git — should contain "gitdir: <abs-path>"
+	dotGitPath := filepath.Join(wtPath, ".git")
+	data, err := os.ReadFile(dotGitPath)
+	if err != nil {
+		return
+	}
+	content := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(content, "gitdir: ") {
+		return
+	}
+	gitdirTarget := strings.TrimPrefix(content, "gitdir: ")
+
+	// Normalise to OS path separators for filepath.Rel
+	gitdirTarget = filepath.FromSlash(gitdirTarget)
+
+	// Only fix if the path is absolute
+	if filepath.IsAbs(gitdirTarget) {
+		rel, err := filepath.Rel(wtPath, gitdirTarget)
+		if err == nil {
+			// Git requires forward slashes
+			rel = filepath.ToSlash(rel)
+			os.WriteFile(dotGitPath, []byte("gitdir: "+rel+"\n"), 0644)
+		}
+	}
+
+	// 2. Read {gitdirTarget}/gitdir — should contain the abs path back to wtPath/.git
+	//    Use the original (possibly absolute) target so we can find the file
+	gitdirFile := filepath.Join(filepath.FromSlash(gitdirTarget), "gitdir")
+	data2, err := os.ReadFile(gitdirFile)
+	if err != nil {
+		return
+	}
+	backPointer := strings.TrimSpace(string(data2))
+	backPointer = filepath.FromSlash(backPointer)
+
+	if filepath.IsAbs(backPointer) {
+		gitdirDir := filepath.Dir(gitdirFile)
+		rel, err := filepath.Rel(gitdirDir, backPointer)
+		if err == nil {
+			rel = filepath.ToSlash(rel)
+			os.WriteFile(gitdirFile, []byte(rel+"\n"), 0644)
+		}
+	}
 }
 
 // CreateForIssue creates a worktree for an issue, branching from the base branch.
