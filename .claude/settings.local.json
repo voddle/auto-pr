@@ -18,7 +18,8 @@
       "Bash(./auto-pr.exe:*)",
       "Bash(go vet:*)",
       "Bash(echo:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(git mv:*)"
     ]
   }
 }

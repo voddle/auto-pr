@@ -118,9 +118,6 @@ auto-pr watch --repo --docker
 
 # Single-PR mode with Docker isolation
 auto-pr watch --docker
-
-# Build the worker image manually
-docker build -t auto-pr-worker .
 ```
 
 **How it works:**
@@ -129,6 +126,13 @@ docker build -t auto-pr-worker .
 - `GH_TOKEN` and `ANTHROPIC_API_KEY` are passed as environment variables
 - `claude -p --continue` session continuity works because each worktree directory is unique
 - Without `--docker`, behavior is identical to before (backward compatible)
+
+**Dockerfile resolution order** (first match wins):
+1. `DOCKER_FILE=/path/to/Dockerfile` in `.pr-watch.conf` — explicit path
+2. `{projectRoot}/Dockerfile.autopr` — project-specific customization
+3. Embedded default — fat dev image with Go, Python, Node.js, Rust, gh, claude CLI
+
+The embedded default image provides a comprehensive development environment (~2.5GB) so workers can build most projects out of the box. To customize, place a `Dockerfile.autopr` in the target repo root.
 
 **Prerequisites for Docker mode:**
 - Docker Desktop installed and running
@@ -146,6 +150,7 @@ WORKTREE_DIR=".worktrees"  # Worktree directory
 # BASE_BRANCH="main"      # Base branch for new issue branches (default: repo default branch)
 DOCKER=false              # Enable Docker container isolation (true/false)
 DOCKER_IMAGE="auto-pr-worker"  # Docker image name for worker containers
+# DOCKER_FILE="/path/to/Dockerfile"  # Custom Dockerfile path (default: auto-resolve)
 ```
 
 CLI flags (`--interval`, `--max-concurrent`, `--docker`) override config file values.
@@ -184,7 +189,7 @@ When processing PR review comments (via `auto-pr watch` or manually), you MUST f
 auto-pr/
   go.mod
   main.go                       # Entry point, subcommand dispatch
-  Dockerfile                    # Worker container image (for --docker mode)
+  Dockerfile.example             # Example Dockerfile for reference (embedded default is used at runtime)
   internal/
     ghcli/ghcli.go              # gh CLI detection + execution wrapper
     config/config.go            # .pr-watch.conf parsing + CLI flag merging

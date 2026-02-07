@@ -27,6 +27,11 @@ func RunWatch(args []string) int {
 		return 1
 	}
 
+	// Auto-generate default config if missing
+	if config.GenerateDefault(projectRoot) {
+		fmt.Println("[auto-pr] Generated default .pr-watch.conf (edit as needed)")
+	}
+
 	// Load config
 	cfg := config.Load(projectRoot)
 
@@ -94,7 +99,7 @@ func RunWatch(args []string) int {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			return 1
 		}
-		dockerMgr = container.NewManager(cfg.DockerImage, projectRoot)
+		dockerMgr = container.NewManager(cfg.DockerImage, projectRoot, cfg.DockerFile)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -112,6 +117,12 @@ func RunWatch(args []string) int {
 		fmt.Fprintln(os.Stderr, "Error initializing state:", err)
 		return 1
 	}
+
+	// Ensure .gitignore covers state and worktree dirs
+	state.EnsureGitignore(projectRoot, []string{
+		".pr-watch-state/",
+		cfg.WorktreeDir + "/",
+	})
 
 	if *repoMode {
 		wcfg := watch.WorkerConfig{

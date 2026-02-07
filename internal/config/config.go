@@ -17,6 +17,7 @@ type Config struct {
 	BaseBranch    string
 	DockerEnabled bool
 	DockerImage   string
+	DockerFile    string // explicit Dockerfile path (DOCKER_FILE config key)
 }
 
 // DefaultConfig returns the default configuration.
@@ -30,6 +31,46 @@ func DefaultConfig() Config {
 		DockerEnabled: false,
 		DockerImage:   "auto-pr-worker",
 	}
+}
+
+const defaultConfTemplate = `# auto-pr watch configuration
+# Uncomment and edit values as needed. Defaults are shown.
+
+# Max concurrent worker processes
+# MAX_CONCURRENT=2
+
+# Poll interval in seconds
+# INTERVAL=30
+
+# Issue labels that trigger auto-processing (comma-separated)
+# ISSUE_LABELS="auto,claude"
+
+# Directory for git worktrees
+# WORKTREE_DIR=".worktrees"
+
+# Base branch for new issue branches (default: repo default branch)
+# BASE_BRANCH="main"
+
+# Enable Docker container isolation (true/false)
+# DOCKER=false
+
+# Docker image name for worker containers
+# DOCKER_IMAGE="auto-pr-worker"
+
+# Custom Dockerfile path (default: auto-resolve)
+# Lookup order: DOCKER_FILE -> {repo}/Dockerfile.autopr -> embedded default
+# DOCKER_FILE=""
+`
+
+// GenerateDefault creates a .pr-watch.conf with commented-out defaults
+// if the file does not already exist. Returns true if a file was created.
+func GenerateDefault(projectRoot string) bool {
+	path := filepath.Join(projectRoot, ".pr-watch.conf")
+	if _, err := os.Stat(path); err == nil {
+		return false // already exists
+	}
+	os.WriteFile(path, []byte(defaultConfTemplate), 0644)
+	return true
 }
 
 // Load reads .pr-watch.conf from projectRoot and returns the config.
@@ -79,6 +120,8 @@ func Load(projectRoot string) Config {
 			if val != "" {
 				cfg.DockerImage = val
 			}
+		case "DOCKER_FILE":
+			cfg.DockerFile = val
 		}
 	}
 	return cfg

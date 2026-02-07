@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"auto-pr/internal/claude"
@@ -47,7 +46,7 @@ func SinglePR(ctx context.Context, repo, projectRoot string, prNum, interval int
 	// If Docker mode is enabled, start a container for this PR
 	var containerID string
 	if dockerMgr != nil {
-		if err := dockerMgr.EnsureImage(ctx, filepath.Join(projectRoot, "Dockerfile")); err != nil {
+		if err := dockerMgr.EnsureImage(ctx); err != nil {
 			return fmt.Errorf("docker image build failed: %w", err)
 		}
 		containerName := fmt.Sprintf("worker-pr-%d", prNum)

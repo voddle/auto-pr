@@ -28,7 +28,7 @@ func Repo(ctx context.Context, repo, projectRoot string, interval, maxConcurrent
 
 	// Ensure Docker image exists if Docker mode is enabled
 	if dockerMgr != nil {
-		if err := dockerMgr.EnsureImage(ctx, filepath.Join(projectRoot, "Dockerfile")); err != nil {
+		if err := dockerMgr.EnsureImage(ctx); err != nil {
 			return fmt.Errorf("docker image build failed: %w", err)
 		}
 	}

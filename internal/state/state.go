@@ -109,6 +109,51 @@ func (d *Dir) LogPath(issueNum int) string {
 	return filepath.Join(d.Root, "logs", fmt.Sprintf("issue-%d.log", issueNum))
 }
 
+// EnsureGitignore appends entries to .gitignore if they are not already present.
+func EnsureGitignore(projectRoot string, entries []string) {
+	gitignorePath := filepath.Join(projectRoot, ".gitignore")
+
+	existing := ""
+	if data, err := os.ReadFile(gitignorePath); err == nil {
+		existing = string(data)
+	}
+
+	var toAdd []string
+	for _, entry := range entries {
+		// Check if line is already present (exact line match)
+		found := false
+		for _, line := range strings.Split(existing, "\n") {
+			if strings.TrimSpace(line) == entry {
+				found = true
+				break
+			}
+		}
+		if !found {
+			toAdd = append(toAdd, entry)
+		}
+	}
+
+	if len(toAdd) == 0 {
+		return
+	}
+
+	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	// Ensure we start on a new line
+	if existing != "" && !strings.HasSuffix(existing, "\n") {
+		f.WriteString("\n")
+	}
+
+	f.WriteString("\n# auto-pr state (auto-generated)\n")
+	for _, entry := range toAdd {
+		f.WriteString(entry + "\n")
+	}
+}
+
 // atomicWrite writes data to a file atomically using a temp file + rename.
 func atomicWrite(path string, data []byte) error {
 	dir := filepath.Dir(path)
