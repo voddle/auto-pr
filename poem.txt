@@ -10,6 +10,21 @@ A few short lines to fill this space.
 No bugs to fix, no features grand,
 Just words arranged as someone planned.
 
+Through branches forked and merges clean,
+The finest workflow ever seen.
+A commit message, short and true,
+Says "fix #9" — and that will do.
+
+The reviewer reads with careful eye,
+And asks for more — we shall comply.
+For poetry, like code, can grow,
+With every push, a better flow.
+
+In open source we find our song,
+A community where all belong.
+Each issue opened, each PR made,
+Is one more step in the parade.
+
 The pull request will come and go,
 The CI checks will pass (we hope so).
 And when the merge at last is done,
